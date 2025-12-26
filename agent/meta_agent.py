@@ -54,6 +54,20 @@ class MetaAgent:
         # 2. Initialize Auditor
         self.trace_logger = TraceLogger()
         
+        # 3. Load System Base Instructions
+        self.system_base = ""
+        try:
+            # Assuming system_base.txt is in the project root based on context
+            base_path = project_root / "system_base.txt"
+            if base_path.exists():
+                with open(base_path, "r", encoding="utf-8") as f:
+                    self.system_base = f.read().strip()
+                logger.info("Loaded system_base.txt directives successfully.")
+            else:
+                logger.warning(f"system_base.txt not found at {base_path}. Agents will run without global directives.")
+        except Exception as e:
+            logger.error(f"Failed to load system_base.txt: {e}")
+        
         logger.info("MetaAgent initialized with Smart P-T-V-E Architecture.")
 
     def generate_response(self, user_id: str, query: str) -> str:
@@ -67,6 +81,7 @@ class MetaAgent:
         user_profile = self.memory.get_profile(user_id)
 
         # --- 2. Semantic Cache Check ---
+        # Note: Cache uses the raw query to ensure hits match user intent, not system prompt variations.
         cached_response = retrieve_cache(query, user_profile)
         if cached_response:
             logger.info("Semantic Cache HIT.")
@@ -76,7 +91,11 @@ class MetaAgent:
         # --- 3. Context Retrieval ---
         chat_history = self.memory.get_immediate_context(user_id)
         
-        # --- 4. Cognitive Loop (Smart Retry) ---
+        # --- 4. Prepare System-Aware Context ---
+        # Interject system_base before the prompt for all agents to enforce Truth Gate/Core Directives.
+        system_aware_query = f"{self.system_base}\n\n[USER QUERY START]\n{query}\n[USER QUERY END]" if self.system_base else query
+        
+        # --- 5. Cognitive Loop (Smart Retry) ---
         loop_count = 0
         current_plan: Optional[PlanSchema] = None
         
@@ -100,7 +119,7 @@ class MetaAgent:
             if fault_source == "planner" or current_plan is None:
                 logger.info("Calling Planner...")
                 current_plan = self.planner.generate_plan(
-                    user_query=query, 
+                    user_query=system_aware_query, # Inject System Base
                     chat_history=chat_history,
                     external_feedback=planner_feedback
                 )
@@ -122,7 +141,7 @@ class MetaAgent:
             previous_draft = final_thinker_output.draft_answer if final_thinker_output else None
 
             thinker_output = self.thinker.execute_plan(
-                user_query=query,
+                user_query=system_aware_query, # Inject System Base
                 plan=current_plan,
                 chat_history=chat_history,
                 previous_draft=previous_draft,
@@ -143,7 +162,7 @@ class MetaAgent:
             # C. VERIFICATION PHASE
             logger.info("Calling Verifier...")
             report = self.verifier.verify_response(
-                user_query=query,
+                user_query=system_aware_query, # Inject System Base
                 thinker_output=thinker_output,
                 plan=current_plan
             )
@@ -182,20 +201,21 @@ class MetaAgent:
                 logger.error("Max Retries Reached. Proceeding with best effort.")
                 break
 
-        # --- 5. Final Output Generation ---
+        # --- 6. Final Output Generation ---
         response_text = self.explainer.explain(
-            user_query=query,
+            user_query=system_aware_query, # Inject System Base
             user_profile=user_profile,
             plan=current_plan,
             thinker_output=final_thinker_output,
             verification_report=final_verification_report
         )
 
-        # --- 6. Memory & Cache ---
+        # --- 7. Memory & Cache ---
+        # Store using the original RAW query to maintain clean user history without system injection artifacts.
         self.memory.process_realtime_interaction(user_id, query, response_text)
         store_cache(query, response_text, user_profile)
         
-        # --- 7. Trace Logging ---
+        # --- 8. Trace Logging ---
         self._log_trace(user_id, query, user_profile, current_plan, final_thinker_output, iteration_log)
         
         elapsed = time.time() - start_time
