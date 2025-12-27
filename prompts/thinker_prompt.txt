@@ -34,6 +34,7 @@ RULES:
    - Explain your synthesis logic in 'xai_trace'.
 
 5. REASONING:
+   - Try your best to find the quantities that user wants from the quantities that you have, for ex- Net Profit = Total Price of Net quantities Sold - Total Selling Price, but do not hallucinate them.
    - Perform calculation and explain how you got that answer, after what calculation in xai_trace.
    - You shouldn't hallucinate numbers and perform correct multi Chunk synthesis.
 

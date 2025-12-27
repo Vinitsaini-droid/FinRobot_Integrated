@@ -31,10 +31,25 @@ class Verifier:
     Checks adherence to the original Plan.
     """
     def __init__(self):
-        self.prompt_path = project_root / "prompts" / "verifier_prompt.txt"
+        self.prompts_dir = project_root / "prompts"
+        self.prompt_path = self.prompts_dir / "verifier_prompt.txt"
+        self.system_base_path = self.prompts_dir / "system_base.txt"
+        
+        self.system_base = ""
+        self.template = ""
+        
         self._load_prompt_template()
 
     def _load_prompt_template(self):
+        # 1. Load System Base
+        if self.system_base_path.exists():
+            with open(self.system_base_path, "r", encoding="utf-8") as f:
+                self.system_base = f.read().strip()
+            logger.info("Verifier loaded system_base.txt")
+        else:
+            logger.warning("system_base.txt not found. Verifier running without global directives.")
+
+        # 2. Load Verifier Template
         if not self.prompt_path.exists():
             raise FileNotFoundError(f"Verifier prompt missing at: {self.prompt_path}")
         
@@ -71,7 +86,10 @@ class Verifier:
         compliance_section = json.dumps(COMPLIANCE_RULES, indent=2)
 
         # 2. Inject into Prompt
-        system_prompt = self.template
+        # Prepend System Base to the Verifier Template
+        combined_template = f"{self.system_base}\n\n{self.template}"
+        system_prompt = combined_template
+        
         system_prompt = system_prompt.replace("{USER_QUERY}", user_query)
         system_prompt = system_prompt.replace("{DRAFT_ANSWER}", draft_answer)
         system_prompt = system_prompt.replace("{EVIDENCE_CONTEXT}", evidence_context)

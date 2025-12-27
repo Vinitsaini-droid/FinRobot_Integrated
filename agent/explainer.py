@@ -13,7 +13,7 @@ if str(project_root) not in sys.path:
 from agent.schemas import (
     VerificationReport, 
     UserProfileSchema, 
-    ThinkerOutput,
+    ThinkerOutput, 
     PlanSchema,
     VerificationStatus
 )
@@ -29,10 +29,25 @@ class Explainer:
     Adapts explanation depth, tone, and addresses prior misunderstandings.
     """
     def __init__(self):
-        self.prompt_path = project_root / "prompts" / "explainer_prompt.txt"
+        self.prompts_dir = project_root / "prompts"
+        self.prompt_path = self.prompts_dir / "explainer_prompt.txt"
+        self.system_base_path = self.prompts_dir / "system_base.txt"
+        
+        self.system_base = ""
+        self.system_prompt_template = ""
+        
         self._load_prompt_template()
 
     def _load_prompt_template(self):
+        # 1. Load System Base
+        if self.system_base_path.exists():
+            with open(self.system_base_path, "r", encoding="utf-8") as f:
+                self.system_base = f.read().strip()
+            logger.info("Explainer loaded system_base.txt")
+        else:
+            logger.warning("system_base.txt not found. Explainer running without global directives.")
+
+        # 2. Load Explainer Template
         if not self.prompt_path.exists():
             raise FileNotFoundError(f"Explainer prompt missing at: {self.prompt_path}")
         
@@ -108,8 +123,11 @@ class Explainer:
         risk_instr = risk_map.get(user_profile.risk_tolerance, risk_map['medium'])
 
         # --- Prompt Population ---
-        # We use the filtered strings from Step 2 to populate the prompt
-        system_prompt = self.system_prompt_template.replace("{USER_QUERY}", user_query)
+        # Prepend System Base to the Explainer Template
+        combined_template = f"{self.system_base}\n\n{self.system_prompt_template}"
+        system_prompt = combined_template
+        
+        system_prompt = system_prompt.replace("{USER_QUERY}", user_query)
         system_prompt = system_prompt.replace("{VERIFIED_ANSWER}", verified_answer_context)
         system_prompt = system_prompt.replace("{VERIFICATION_NOTE}", verification_report.critique)
         

@@ -41,14 +41,26 @@ class Thinker:
     """
     def __init__(self):
         self.prompt_path = project_root / "prompts" / "thinker_prompt.txt"
+        self.base_prompt_path = project_root / "prompts" / "system_base.txt"
         self._load_prompt_template()
 
     def _load_prompt_template(self):
+        # Load Base Prompt
+        base_content = ""
+        if self.base_prompt_path.exists():
+             with open(self.base_prompt_path, "r", encoding="utf-8") as f:
+                base_content = f.read() + "\n\n"
+        else:
+            logger.warning(f"System base prompt missing at: {self.base_prompt_path}")
+
+        # Load Thinker Specific Prompt
         if not self.prompt_path.exists():
             # Fallback if file is missing, though file creation is preferred
             raise FileNotFoundError(f"Thinker prompt not found at {self.prompt_path}")
+        
         with open(self.prompt_path, "r", encoding="utf-8") as f:
-            self.system_prompt_template = f.read()
+            # Prepend base prompt to the thinker prompt
+            self.system_prompt_template = base_content + f.read()
 
     def execute_plan(
         self, 
