@@ -84,6 +84,10 @@ class Thinker:
         
         retrieved_chunks: List[Chunk] = []
         execution_log: List[str] = []
+        
+        # SYSTEM TRACE COLLECTOR: Captures hard evidence for the Verifier
+        # Must strictly match ReasoningTrace schema
+        system_traces: List[Dict[str, Any]] = []
 
         # --- 1. Execute Actions (Strict Execution) ---
         for i, step in enumerate(plan.steps):
@@ -111,6 +115,21 @@ class Thinker:
                             msg = f"✓ Retrieved {len(results)} chunks for query: '{step.query}'"
                             execution_log.append(msg)
                             logger.info(msg)
+                            
+                            # --- EVIDENCE CAPTURE START ---
+                            # Capture the actual content so Verifier can see it in reasoning_traces.
+                            evidence_text = "\n".join([f"[Source {c.id}]: {c.text}" for c in results])
+                            
+                            # Create a valid ReasoningTrace dict
+                            system_trace = {
+                                "step_id": i + 1,  # Must be INT
+                                "action": "retrieve", # Matches ActionType.RETRIEVE
+                                "query": step.query,
+                                "thought": f"System executed retrieval for query: {step.query}", # Required field
+                                "observation": evidence_text
+                            }
+                            system_traces.append(system_trace)
+                            # --- EVIDENCE CAPTURE END ---
                         else:
                             msg = f"⚠ Retrieval returned 0 results for query: '{step.query}'"
                             execution_log.append(msg)
@@ -128,8 +147,6 @@ class Thinker:
                 logger.debug("Processing reasoning step (Internal Monologue).")
                 
             else:
-                # If Planner passed CLARIFY, REFUSE, or VERIFY, the Thinker skips it.
-                # The Planner should have resolved CLARIFY before this stage.
                 logger.debug(f"Thinker skipping non-executable action: {action_str}")
 
         # --- 2. Context Construction ---
@@ -180,20 +197,39 @@ class Thinker:
             if not data:
                 raise ValueError("LLM returned empty JSON.")
             
-            # --- CRITICAL FIX: Sanitize Action Enums ---
-            # LLMs sometimes hallucinate actions like 'refine', 'summarize' or 'analyze'.
-            # We catch these before Pydantic validation and force them to 'reason'.
-            if "reasoning_traces" in data and isinstance(data["reasoning_traces"], list):
+            # --- CRITICAL FIX: Merge System Traces with LLM Traces ---
+            if "reasoning_traces" not in data:
+                data["reasoning_traces"] = []
+            
+            # Prepend system traces (Hard Evidence) to LLM traces (Reasoning)
+            # This ensures the Verifier sees the actual retrieval data.
+            data["reasoning_traces"] = system_traces + data["reasoning_traces"]
+            
+            # --- CRITICAL FIX: Sanitize Traces ---
+            # Ensure every trace meets the Pydantic Schema requirements
+            if isinstance(data["reasoning_traces"], list):
                 valid_actions = {a.value for a in ActionType}
-                for trace in data["reasoning_traces"]:
+                
+                for idx, trace in enumerate(data["reasoning_traces"]):
                     if isinstance(trace, dict):
-                        # Normalize to lower case string
+                        # 1. Ensure step_id is an INT
+                        if "step_id" not in trace or trace["step_id"] is None:
+                            trace["step_id"] = idx + 1
+                        else:
+                            try:
+                                trace["step_id"] = int(trace["step_id"])
+                            except:
+                                trace["step_id"] = idx + 1
+
+                        # 2. Ensure Action is Valid
                         current_action = str(trace.get("action", "")).lower()
-                        
                         if current_action not in valid_actions:
-                            logger.warning(f"Sanitizing invalid Thinker action '{current_action}' to 'reason'")
                             # Map to safe fallback
                             trace["action"] = ActionType.REASON.value
+                        
+                        # 3. Ensure 'thought' exists (Required field)
+                        if "thought" not in trace or not trace["thought"]:
+                            trace["thought"] = "Processing step..."
 
             return ThinkerOutput.model_validate(data)
 

@@ -101,12 +101,19 @@ class Explainer:
             )
 
         # 4. Personalization Context & Mapping
+        # Format general free-text preferences
+        custom_prefs_str = "None"
+        if user_profile.preferences:
+            # Join list into a comma-separated string for the prompt
+            custom_prefs_str = ", ".join(user_profile.preferences)
+
         profile_context_str = (
             f"Explanation Depth: {depth_mode.upper()}\n"
             f"Tone Preference: {user_profile.style_preference.upper()}\n"
-            f"Risk Tolerance: {user_profile.risk_tolerance.upper()}"
+            f"Risk Tolerance: {user_profile.risk_tolerance.upper()}\n"
+            f"Specific User Constraints: {custom_prefs_str}"
         )
-        
+
         # Map Enums to Natural Language Instructions
         tone_map = {
             'formal': "Professional, objective, and precise banking language.",
