@@ -83,7 +83,7 @@ def main():
     print_header()
     
     # 1. Initialize Components
-    user_id = input("Enter your user_id:")  # Single user mode for CLI
+    user_id = input("Enter your user_id:")  
     agent = MetaAgent()
     critics = AspectCritics()
     ragas = RagasRunner()
