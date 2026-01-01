@@ -1,7 +1,8 @@
 # retrieval/semantic_cache.py
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import time
 import sys
+import json
 from pathlib import Path
 
 # --- Path Setup ---
@@ -13,7 +14,7 @@ if str(project_root) not in sys.path:
 from retrieval.pinecone_client import index
 from utils.llm_client import get_embedding
 from utils.logger import get_logger
-from agent.schemas import UserProfileSchema
+from agent.schemas import PlanSchema, ThinkerOutput, VerificationReport
 
 logger = get_logger("SEMANTIC_CACHE")
 
@@ -31,52 +32,50 @@ def clear_cache() -> bool:
         logger.error(f"Cache clear failed: {e}")
         return False
 
-def store_cache(query: str, response: str, profile: Optional[UserProfileSchema] = None) -> None:
+def store_cache(
+    query: str, 
+    plan: PlanSchema,
+    thinker_output: ThinkerOutput,
+    verification_report: VerificationReport
+) -> None:
     """
-    Stores response with Profile Metadata (Style, Depth, Risk) to ensure context-aware retrieval.
-    The cache entry is 'stamped' with the personality settings active at the time of generation.
+    Stores reasoning artifacts (Plan, Thinker, Verifier) instead of final text.
+    This allows the Explainer to re-render the response based on dynamic User Profile settings.
     """
-    if not response or not query or not index: 
+    if not query or not index: 
         return
 
     try:
         vector = get_embedding(query)
         if not vector: return
 
-        # Default metadata
+        # Serialize artifacts to JSON strings (Pinecone metadata must be flat)
         metadata = {
             "query": query,
-            "cached_response": response,
+            "plan_json": plan.model_dump_json(),
+            "thinker_output_json": thinker_output.model_dump_json(),
+            "verification_report_json": verification_report.model_dump_json(),
             "timestamp": time.time()
         }
 
-        # Add Profile Context if available
-        if profile:
-            metadata.update({
-                "style": profile.style_preference,       # e.g., 'formal', 'casual'
-                "depth": profile.explanation_depth,      # e.g., 'detailed', 'simple'
-                "risk": profile.risk_tolerance           # e.g., 'low', 'high'
-            })
-
-        # ID is hash of query + profile config to allow unique entries for different personalities
-        # (Simple hash of query is usually enough if we filter, but unique IDs help debugging)
+        # ID is hash of query ONLY. We do not stamp profile data anymore.
         import hashlib
-        id_str = f"{query}_{profile.style_preference if profile else 'default'}_{profile.explanation_depth if profile else 'default'}"
+        id_str = f"{query}"
         unique_id = hashlib.md5(id_str.encode()).hexdigest()
 
         index.upsert(
             vectors=[(unique_id, vector, metadata)],
             namespace=CACHE_NAMESPACE
         )
-        logger.debug(f"Stored in cache: {unique_id[:8]}...")
+        logger.debug(f"Stored artifacts in cache: {unique_id[:8]}...")
 
     except Exception as e:
         logger.error(f"Cache store failed: {e}")
 
-def retrieve_cache(query: str, profile: Optional[UserProfileSchema] = None) -> Optional[str]:
+def retrieve_cache(query: str) -> Optional[Dict[str, Any]]:
     """
-    Retrieves a cached answer ONLY if it matches the current User Profile settings.
-    This prevents returning a 'simple' answer when the user has switched to 'technical'.
+    Retrieves cached reasoning artifacts if a semantic match is found.
+    Returns a dictionary containing the reconstructed Pydantic models.
     """
     if not index or not query: return None
 
@@ -84,24 +83,12 @@ def retrieve_cache(query: str, profile: Optional[UserProfileSchema] = None) -> O
         query_vector = get_embedding(query)
         if not query_vector: return None
 
-        # Build Strict Filter
-        # We only accept cache hits that match the user's CURRENT needs.
-        filter_dict: Dict[str, Any] = {}
-        
-        if profile:
-            filter_dict = {
-                "style": profile.style_preference,
-                "depth": profile.explanation_depth,
-                "risk": profile.risk_tolerance
-            }
-
-        # Query Pinecone with filter
+        # Query Pinecone without profile filters
         results = index.query(
             vector=query_vector,
             top_k=1,
             include_metadata=True,
-            namespace=CACHE_NAMESPACE,
-            filter=filter_dict if filter_dict else None  # <--- The Smart Filter
+            namespace=CACHE_NAMESPACE
         )
 
         matches = results.get('matches', [])
@@ -110,8 +97,19 @@ def retrieve_cache(query: str, profile: Optional[UserProfileSchema] = None) -> O
 
         match = matches[0]
         if match.score >= CACHE_THRESHOLD:
-            logger.info(f"CACHE HIT ({match.score:.4f}) | Filter Used: {filter_dict}")
-            return match.metadata.get('cached_response')
+            meta = match.metadata
+            logger.info(f"CACHE HIT ({match.score:.4f}) | Retrieving Artifacts...")
+            
+            try:
+                # Reconstruct Pydantic models from JSON strings
+                return {
+                    "plan": PlanSchema.model_validate_json(meta["plan_json"]),
+                    "thinker_output": ThinkerOutput.model_validate_json(meta["thinker_output_json"]),
+                    "verification_report": VerificationReport.model_validate_json(meta["verification_report_json"])
+                }
+            except Exception as parse_err:
+                logger.error(f"Failed to deserialize cached artifacts: {parse_err}")
+                return None
         
         return None
 

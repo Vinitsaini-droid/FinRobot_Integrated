@@ -32,8 +32,6 @@ CHECKLIST:
 3. Are there redundant steps?
 4. Is the risk level appropriate?
 
-Output for Critique: PlanCritique JSON (validity, critique, suggestions).
-
 --- MODE C: REFINEMENT (Fixing based on Critique) ---
 1. Parse the {FEEDBACK} (Critique + Suggestions).
 2. Rewrite the plan to address the specific failure points.
@@ -46,17 +44,3 @@ Output for Critique: PlanCritique JSON (validity, critique, suggestions).
 - "verify": Request verification.
 - "refuse": Block unsafe requests.
 
---- OUTPUT (JSON ONLY) ---
-{
-  "steps": [
-    {
-      "step_id": int,
-      "action": "clarify" | "retrieve" | "reason" | "verify" | "refuse",
-      "query": "Exact purpose",
-      "status": "pending"
-    }
-  ],
-  "risk_level": "low" | "medium" | "high",
-  "requires_compliance": boolean,
-  "xai_notes": "Rationale"
-}

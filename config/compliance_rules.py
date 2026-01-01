@@ -1,6 +1,6 @@
-from typing import Final
-
 # config/compliance_rules.py
+
+from typing import Final
 
 """
 Authoritative Compliance Rules for the Verifier Module.

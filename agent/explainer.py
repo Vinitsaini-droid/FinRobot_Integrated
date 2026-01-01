@@ -2,7 +2,8 @@
 import sys
 import json
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, Dict, Any, Type, List
+from pydantic import BaseModel, Field, ConfigDict
 
 # --- Path Setup ---
 current_dir = Path(__file__).resolve().parent
@@ -15,13 +16,48 @@ from agent.schemas import (
     UserProfileSchema, 
     ThinkerOutput, 
     PlanSchema,
-    VerificationStatus
+    ExplainerOutput,
+    ReasoningTrace,
+    XAICitation
 )
 from config.token_budgets import TOKEN_BUDGETS
-from utils.llm_client import generate_secondary
+from utils.llm_client import (
+    generate_secondary, 
+    generate_schema_critique, 
+    repair_json_with_llm
+)
+from utils.json_utils import (
+    safe_json_load, 
+    validate_json_structure, 
+    repair_json
+)
 from utils.logger import get_logger
+from config.token_budgets import TOKEN_BUDGETS
 
 logger = get_logger("EXPLAINER")
+
+# --- Internal Schemas for LLM Generation Only ---
+class ExplainerMetadata(BaseModel):
+    """
+    Strict definition of metadata to prevent validation errors 
+    when the LLM adds fields like 'risk_assessment' or 'depth'.
+    """
+    model_config = ConfigDict(extra='allow') # Allow LLM to add extra metadata fields without crashing
+    
+    tone_used: str = Field(..., description="The tone adopted (e.g., formal, casual)")
+    depth_mode: str = Field(..., description="The explanation depth (e.g., detailed, simple)")
+    risk_level: str = Field(..., description="Risk assessment of the answer")
+
+class ExplainerLLMResponse(BaseModel):
+    """
+    Subset of ExplainerOutput for the LLM to generate.
+    We exclude 'plan', 'reasoning_traces', and 'citations' to prevent hallucinations.
+    """
+    thought_process: str = Field(..., description="Brief thought on how to frame the answer")
+    explanation: str = Field(..., description="The final response text for the user.")
+    meta_data: ExplainerMetadata = Field(..., description="Meta information about the response style")
+
+# ------------------------------------------------
 
 class Explainer:
     """
@@ -37,132 +73,260 @@ class Explainer:
         self.system_prompt_template = ""
         
         self._load_prompt_template()
+        logger.info("Explainer Loaded")
 
     def _load_prompt_template(self):
         # 1. Load System Base
         if self.system_base_path.exists():
             with open(self.system_base_path, "r", encoding="utf-8") as f:
                 self.system_base = f.read().strip()
-            logger.info("Explainer loaded system_base.txt")
         else:
             logger.warning("system_base.txt not found. Explainer running without global directives.")
 
         # 2. Load Explainer Template
         if not self.prompt_path.exists():
-            raise FileNotFoundError(f"Explainer prompt missing at: {self.prompt_path}")
-        
-        with open(self.prompt_path, "r", encoding="utf-8") as f:
-            self.system_prompt_template = f.read()
+            self.system_prompt_template = (
+                "You are the Explainer Agent. Synthesize the provided context into a helpful response."
+            )
+        else:
+            with open(self.prompt_path, "r", encoding="utf-8") as f:
+                self.system_prompt_template = f.read()
 
-    def explain(
+    def generate_explanation(
         self,
         user_query: str,
         user_profile: UserProfileSchema,
         plan: PlanSchema,
         thinker_output: ThinkerOutput,
         verification_report: VerificationReport
-    ) -> str:
+    ) -> ExplainerOutput:
         """
-        Generates the final user-facing response.
+        Generates the ExplainerOutput object (Schema Generation).
         """
-        # 1. Prepare XAI Citations (Append to answer so Explainer sees the sources)
-        citations_text = ""
-        if verification_report.xai_citations:
-            # Format: [Source ID] Snippet...
-            citations_list = [f"[{c.evidence_ids}] {c.claim}..." for c in verification_report.xai_citations]
-            citations_text = "\n\n**Verified Sources:**\n" + "\n".join(citations_list)
+        logger.info("=== EXPLAINER STARTED ===")
         
-        # Combine Draft Answer with Citations for the prompt context
-        verified_answer_context = thinker_output.draft_answer + citations_text
-
-        # 2. Smart Depth Logic (Conditional Context Injection)
-        # We filter the context *before* the prompt to strictly enforce depth preferences and save tokens.
-        depth_mode = user_profile.explanation_depth # 'simple', 'detailed', 'technical'
-        
-        plan_summary_str = "Not provided (User requested Simple mode)."
-        reasoning_traces_str = "Not provided (User requested non-Technical mode)."
-
-        if depth_mode in ['detailed', 'technical']:
-            # 'detailed' and 'technical' both see the Plan
-            plan_summary_str = "\n".join([f"{idx+1}. {step.query}" for idx, step in enumerate(plan.steps)])
-        
-        if depth_mode == 'technical':
-            # Only 'technical' sees the raw Reasoning Traces
-            reasoning_traces_str = json.dumps([t.model_dump() for t in thinker_output.reasoning_traces], indent=2)
-
-        # 3. Smart Misunderstandings Handling
-        # Inject constraint: Only address if relevant to THIS query.
-        misunderstandings_str = "None."
-        if user_profile.prior_misunderstandings_summary:
-            misunderstandings_str = (
-                f"[User History: {user_profile.prior_misunderstandings_summary}]\n"
-                f"[Constraint: Explicitly address this history ONLY if it is directly relevant to the query: '{user_query}'. "
-                f"If unrelated, ignore it entirely.]"
-            )
-
-        # 4. Personalization Context & Mapping
-        # Format general free-text preferences
-        custom_prefs_str = "None"
-        if user_profile.preferences:
-            # Join list into a comma-separated string for the prompt
-            custom_prefs_str = ", ".join(user_profile.preferences)
-
-        profile_context_str = (
-            f"Explanation Depth: {depth_mode.upper()}\n"
-            f"Tone Preference: {user_profile.style_preference.upper()}\n"
-            f"Risk Tolerance: {user_profile.risk_tolerance.upper()}\n"
-            f"Specific User Constraints: {custom_prefs_str}"
+        # 1. Prepare Prompt Context
+        system_prompt = self._construct_system_prompt(
+            user_query, user_profile, plan, thinker_output, verification_report
+        )
+        token_limit = TOKEN_BUDGETS.get("EXPLAINER_FINAL_MAX", 1200)
+        user_prompt="GENERATE PERSONALIZED RESPONSE JSON"
+        user_prompt += f"\n\nCONSTRAINT: Keep the final_answer concise (approx {token_limit} tokens)."
+        # 2. Gatekeeper Loop: Generate & Validate JSON
+        # We use ExplainerLLMResponse to force the LLM to focus ONLY on text generation
+        llm_response_data = self._generate_with_retry(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_model=ExplainerLLMResponse, # Pass the restricted schema
+            max_retries=3
         )
 
-        # Map Enums to Natural Language Instructions
-        tone_map = {
-            'formal': "Professional, objective, and precise banking language.",
-            'casual': "Friendly, conversational, and easy to understand.",
-            'concise': "Extremely brief. Bullet points preferred. No fluff."
-        }
-        risk_map = {
-            'low': "Strictly emphasize capital preservation and risks. Be conservative.",
-            'medium': "Balance growth potential with clear risk disclosures.",
-            'high': "Focus on growth potential, but briefly mention volatility."
-        }
-        
-        tone_instr = tone_map.get(user_profile.style_preference, tone_map['formal'])
-        risk_instr = risk_map.get(user_profile.risk_tolerance, risk_map['medium'])
+        if not llm_response_data:
+            return self._create_fallback_output(thinker_output, verification_report, plan)
 
-        # --- Prompt Population ---
-        # Prepend System Base to the Explainer Template
-        combined_template = f"{self.system_prompt_template}\n\n{self.system_base}"
-        system_prompt = combined_template
-        
-        system_prompt = system_prompt.replace("{USER_QUERY}", user_query)
-        system_prompt = system_prompt.replace("{VERIFIED_ANSWER}", verified_answer_context)
-        system_prompt = system_prompt.replace("{VERIFICATION_NOTE}", verification_report.critique)
-        
-        system_prompt = system_prompt.replace("{PROFILE_CONTEXT}", profile_context_str)
-        system_prompt = system_prompt.replace("{MISUNDERSTANDINGS}", misunderstandings_str)
-        
-        # These will contain actual data OR placeholder text based on Depth Logic
-        system_prompt = system_prompt.replace("{PLAN_SUMMARY}", plan_summary_str)
-        system_prompt = system_prompt.replace("{REASONING_TRACES}", reasoning_traces_str)
-        
-        system_prompt = system_prompt.replace("{TONE_INSTRUCTION}", tone_instr)
-        system_prompt = system_prompt.replace("{RISK_INSTRUCTION}", risk_instr)
-
+        # 3. Construct Complete Explainer Output Schema
+        # Merge LLM text output with trustworthy artifacts from upstream agents
         try:
-            # --- Generate Final Response ---
-            response_text = generate_secondary(
-                system_prompt=system_prompt,
-                user_prompt="GENERATE PERSONALIZED RESPONSE",
-                max_tokens=TOKEN_BUDGETS.get("EXPLAINER_FINAL_MAX", 1500),
-                temperature=0.3 # Balanced for fluency and accuracy
-            )
-            return response_text
+            # Extract dict if it's not already
+            if hasattr(llm_response_data, "model_dump"):
+                data_dict = llm_response_data.model_dump()
+            else:
+                data_dict = llm_response_data
 
-        except Exception as e:
-            logger.error(f"Explainer synthesis failed: {e}")
-            # Robust fallback: Return the verified answer directly if synthesis fails
-            return (
-                f"**System Note:** Personalization failed. Here is the raw verified answer:\n\n"
-                f"{thinker_output.draft_answer}\n\n"
-                f"Sources:\n{citations_text}"
+            final_output = ExplainerOutput(
+                thought_process=data_dict.get("thought_process", "No thought process"),
+                explanation=data_dict.get("explanation", "Error in generation"),
+                # ARTIFACT INJECTION: Directly map upstream sources
+                citations=verification_report.xai_citations,
+                plan=plan,
+                reasoning_traces=thinker_output.reasoning_traces,
+                # Metadata from LLM
+                meta_data=data_dict.get("meta_data", {})
             )
+            return final_output
+        except Exception as e:
+            logger.error(f"Error constructing ExplainerOutput: {e}")
+            return self._create_fallback_output(thinker_output, verification_report, plan)
+
+    def render_explanation(self, output: ExplainerOutput, depth_mode: str) -> str:
+        """
+        Formatting Layer: Converts the structured ExplainerOutput into the final string.
+        """
+        buffer = [output.explanation] 
+        buffer.append("\n\n---") 
+
+        # Filter Logic
+        show_plan = depth_mode in ['detailed', 'technical']
+        show_traces = depth_mode == 'technical'
+
+        if show_plan and output.plan:
+            buffer.append("\n**Execution Plan Summary:**")
+            for step in output.plan.steps:
+                status_icon = "✓" if step.status == "completed" else "○"
+                buffer.append(f"- [{status_icon}] {step.query}")
+
+        if show_traces and output.reasoning_traces:
+            buffer.append("\n**Technical Reasoning Traces:**")
+            buffer.append("```json")
+            # Convert Pydantic models to dicts for clean dumping
+            traces_dump = [t.model_dump(mode='json') for t in output.reasoning_traces]
+            buffer.append(json.dumps(traces_dump, indent=2))
+            buffer.append("```")
+            
+        return "\n".join(buffer)
+
+    def _generate_with_retry(
+        self, 
+        system_prompt: str, 
+        user_prompt: str, 
+        response_model: Type[BaseModel],
+        max_retries: int = 3
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Executes generation with a multi-stage self-healing loop.
+        Uses response_model.model_json_schema() to drive validation.
+        """
+        # Generate the strict schema string for validation
+        expected_schema_dict = response_model.model_json_schema()
+        expected_schema_str = json.dumps(expected_schema_dict, indent=2)
+        
+        current_user_prompt = user_prompt + f"\n\n<JSON_SCHEMA>\n{expected_schema_str}\n</JSON_SCHEMA>"
+
+        for attempt in range(max_retries + 1):
+            logger.info(f"Explainer Generation Attempt {attempt + 1}/{max_retries + 1}")
+            
+            # A. Generate Raw Text
+            raw_response = generate_secondary(
+                system_prompt=system_prompt,
+                user_prompt=current_user_prompt,
+                max_tokens=TOKEN_BUDGETS.get("EXPLAINER_FINAL_MAX", 2000),
+                temperature=0.3
+            )
+
+            # --- REPAIR & VALIDATION WATERFALL ---
+            
+            # 1. Primary Check: Validate JSON Structure
+            if validate_json_structure(raw_response, expected_schema_str):
+                data = safe_json_load(raw_response)
+                if data: return data
+
+            # 2. Secondary Check: Heuristic Repair (json_repair)
+            logger.warning("Standard validation failed. Attempting Heuristic Repair...")
+            repaired_heuristic = repair_json(raw_response)
+            if repaired_heuristic:
+                # Convert back to string to validate against strict schema
+                repaired_str = json.dumps(repaired_heuristic)
+                if validate_json_structure(repaired_str, expected_schema_str):
+                    logger.info("Heuristic Repair Successful.")
+                    return repaired_heuristic
+
+            # 3. Tertiary Check: LLM-based Repair
+            logger.warning("Heuristic Repair failed. Attempting LLM Repair...")
+            repaired_llm_str = repair_json_with_llm(expected_schema_str, raw_response)
+            if repaired_llm_str and validate_json_structure(repaired_llm_str, expected_schema_str):
+                logger.info("LLM Repair Successful.")
+                return safe_json_load(repaired_llm_str)
+
+            # 4. Critique & Loop (Constraint Tightening)
+            logger.warning(f"Attempt {attempt + 1} failed completely. Generating Critique...")
+            critique = generate_schema_critique(expected_schema_str, raw_response)
+            
+            if critique and attempt < max_retries:
+                feedback_prompt = (
+                    f"\n\n### PREVIOUS ATTEMPT FAILED ###\n"
+                    f"Critique: {critique.critique}\n"
+                    f"Fix Instructions: {critique.suggestions}\n"
+                    f"Ensure you STRICTLY follow the schema:\n{expected_schema_str}\n"
+                    f"Respond ONLY with the corrected JSON."
+                )
+                current_user_prompt += feedback_prompt
+            else:
+                logger.error("All repairs and retries failed.")
+
+        return None
+
+    def _construct_system_prompt(
+        self,
+        query: str,
+        profile: UserProfileSchema,
+        plan: PlanSchema,
+        thinker: ThinkerOutput,
+        verification: VerificationReport
+    ) -> str:
+        """
+        Dynamically assembles the system prompt.
+        """
+        # Serialize objects for prompt injection
+        profile_json = profile.model_dump_json(indent=2)
+        plan_json = plan.model_dump_json(include={'risk_level', 'xai_notes', 'steps'}, indent=2)
+        
+        # We only pass text traces to prompt context, not ask for them back
+        traces_json = json.dumps([t.model_dump() for t in thinker.reasoning_traces], indent=2)
+
+        verification_summary = f"Status: {verification.verification_status}\nNotes: {verification.critique}"
+
+        prompt = self.system_prompt_template
+        
+        # 1. User & Profile Context
+        prompt = prompt.replace("{USER_QUERY}", query)
+        prompt = prompt.replace("{PROFILE_CONTEXT}", profile_json)
+        
+        # 2. Answers & Verification
+        prompt = prompt.replace("{VERIFIED_ANSWER}", thinker.draft_answer)
+        prompt = prompt.replace("{VERIFICATION_NOTE}", verification_summary)
+        
+        # 3. Optional Context
+        prompt = prompt.replace("{PLAN_SUMMARY}", plan_json)
+        prompt = prompt.replace("{REASONING_TRACES}", traces_json)
+        
+        # 4. Teaching Context
+        misunderstandings = profile.prior_misunderstandings_summary if profile.prior_misunderstandings_summary else "None"
+        prompt = prompt.replace("{MISUNDERSTANDINGS}", misunderstandings)
+
+        # 5. Inject Tone Instructions
+        # CRITICAL FIX: Explicit instruction to avoid verbatim copying
+        tone_instr = (
+            f"Tone: {profile.style_preference}. Depth: {profile.explanation_depth}.\n"
+            f"IMPORTANT: You MUST rewrite the 'Verified Answer' to match the specific tone and depth above. "
+            f"Do NOT copy the answer verbatim."
+        )
+        prompt = prompt.replace("{TONE_INSTRUCTION}", tone_instr)
+
+        # 6. Inject Risk Instructions
+        if verification.verification_status == "RISKY" or plan.risk_level == "high":
+            risk_instr = "WARNING: Topic is HIGH RISK. You must add standard financial disclaimers."
+        else:
+            risk_instr = "Topic is standard. Be helpful and accurate."
+        prompt = prompt.replace("{RISK_INSTRUCTION}", risk_instr)
+
+        return prompt + "\n\n" + self.system_base
+
+    def _create_fallback_output(
+        self, 
+        thinker_output: ThinkerOutput, 
+        verification_report: VerificationReport,
+        plan: PlanSchema
+    ) -> ExplainerOutput:
+        """
+        Robust fallback if personalization fails entirely. Returns a valid ExplainerOutput.
+        """
+        logger.error("Explainer falling back to raw Thinker output.")
+        
+        fallback_text = (
+            f"**System Note:** Personalization failed due to technical constraints. "
+            f"Here is the verified answer:\n\n"
+            f"{thinker_output.draft_answer}"
+        )
+        
+        return ExplainerOutput(
+            thought_process="Fallback triggered due to JSON validation failures.",
+            explanation=fallback_text,
+            citations=verification_report.xai_citations,
+            meta_data={
+                "tone_used": "formal", 
+                "depth_mode": "detailed", 
+                "risk_level": "medium"
+            },
+            plan=plan,
+            reasoning_traces=thinker_output.reasoning_traces
+        )

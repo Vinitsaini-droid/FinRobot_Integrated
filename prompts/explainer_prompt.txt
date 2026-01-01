@@ -31,10 +31,5 @@ Reasoning Logic: {REASONING_TRACES}
 --- CITATION RULES ---
 1. You must preserve the tags from the Verified Answer.
 2. Place citations at the end of the sentence they support.
-3. Do NOT cite the Plan or Reasoning Traces, only the Answer.
+3. Do not place citations for plan and reasoning traces.
 
---- OUTPUT FORMAT ---
-Produce a clean Markdown response.
-- Start with the Answer with xai citations.
-- (If applicable) Add a "Process Overview" section for Detailed/Technical users.
-- (If applicable) Add a "Logic Trace" section for Technical users.

@@ -26,11 +26,9 @@ class AgentStatus(str, Enum):
     ERROR = "error"
 
 class ActionType(str, Enum):
-    CLARIFY = "clarify"
     RETRIEVE = "retrieve"
     REASON = "reason"
     VERIFY = "verify"
-    REFUSE = "refuse"
 
 class VerificationStatus(str, Enum):
     PASS = "PASS"
@@ -70,6 +68,11 @@ class ChatSummary(BaseSchema):
     summary: str
     key_facts: List[str]
 
+class SchemaCritique(BaseSchema):
+    critique: str = Field(..., description="Specific feedback on what is wrong or different with the JSON.")
+    suggestions: str = Field(..., description="How the Model should fix it.")
+
+
 # --- PLANNER OUTPUTS ---
 
 class PlanStep(BaseSchema):
@@ -79,6 +82,7 @@ class PlanStep(BaseSchema):
     status: Literal["failed", "pending", "completed"]
 
 class PlanSchema(BaseSchema):
+    thought_process: str = Field(..., description="Acts as a thought space for reasoning models")
     steps: List[PlanStep]
     risk_level: Literal["low", "medium", "high"]
     requires_compliance: bool
@@ -102,9 +106,11 @@ class ReasoningTrace(BaseSchema):
     observation: Optional[str] = Field(None, description="Result of the action or retrieval")
 
 class ThinkerOutput(BaseSchema):
+    thought_process: str = Field(..., description="Acts as a thought space for reasoning models")
     draft_answer: str = Field(..., description="Concise answer with inline citations")
     key_facts_extracted: List[str] = Field(default_factory=list)
     confidence_score: float = Field(..., ge=0.0, le=1.0)
+    retrieved_context: Optional[str] = Field(None, description="The raw evidence text used to generate the answer")
     missing_information: Optional[str] = Field(
         None, 
         description="Explicit statement of what is missing or if evidence was insufficient"
@@ -126,6 +132,7 @@ class XAICitation(BaseSchema):
     verdict: str = Field(..., description="SUPPORTED | WEAK | UNSUPPORTED | CONTRADICTED")
 
 class VerificationReport(BaseSchema):
+    thought_process: str = Field(..., description="Acts as a thought space for reasoning models")
     verification_status: VerificationStatus
     critique: str = Field(..., description="Exact explanation of errors or confirmation")
     suggested_correction: Optional[str] = Field(None, description="Corrected sentence or logic")
@@ -134,7 +141,26 @@ class VerificationReport(BaseSchema):
         default_factory=list, 
         description="Evidence grounding for specific claims."
     )
-    
+
+# --- EXPLAINER OUTPUTS ---
+
+class ExplainerOutput(BaseSchema):
+    thought_process: str = Field(..., description="Acts as a thought space for reasoning models")
+    explanation: str = Field(..., description="The final, personalized response text with inline citations for the user.")
+    plan: PlanSchema = Field(None, description="The plan executed to derive this answer.")
+    reasoning_traces: List[ReasoningTrace] = Field(
+        default_factory=list, 
+        description="The structured chain of thought and observations."
+    )
+    citations: List[XAICitation] = Field(
+        default_factory=list, 
+        description="Verified evidence grounding the explanation."
+    )
+    meta_data: Dict[str, Any] = Field(
+        default_factory=dict, 
+        description="Metadata including tone, depth, and risk checks."
+    )
+  
 # --- USER PROFILE ---
 
 class UserProfileSchema(BaseSchema):
@@ -172,4 +198,4 @@ class GlobalState(BaseSchema):
     verification_report: Optional[VerificationReport] = None
     
     # Final Output
-    final_response: Optional[str] = None
+    final_response: Optional[ExplainerOutput] = None

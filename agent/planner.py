@@ -1,8 +1,9 @@
-# agent/planner.py
 import sys
 import json
 from pathlib import Path
-from typing import Optional, Dict, Any, Union
+from typing import Optional, Dict, Any, Union, Type, List
+from enum import Enum
+from pydantic import BaseModel, Field
 
 # --- Path Setup ---
 current_dir = Path(__file__).resolve().parent
@@ -12,20 +13,26 @@ if str(project_root) not in sys.path:
 
 from agent.schemas import (
     PlanSchema, 
+    PlanStep,
     ActionType, 
     PlanCritique,
-    PlanValidity
+    PlanValidity,
+    SchemaCritique
 )
-from config.token_budgets import TOKEN_BUDGETS
-from utils.llm_client import generate_secondary, generate_primary
-from utils.json_utils import safe_json_load
+from utils.llm_client import (
+    generate_secondary, 
+    generate_primary, 
+    generate_schema_critique,
+    repair_json_with_llm
+)
+from utils.json_utils import (
+    safe_json_load, 
+    validate_json_structure,
+    repair_json
+)
 from utils.logger import get_logger
-
-try:
-    from retrieval.query_refiner import refine_query_for_planner
-    REFINER_AVAILABLE = True
-except ImportError:
-    REFINER_AVAILABLE = False
+from retrieval.query_refiner import refine_query_for_planner
+from config.token_budgets import TOKEN_BUDGETS
 
 logger = get_logger("PLANNER")
 
@@ -38,221 +45,271 @@ class Planner:
         self.prompt_path = project_root / "prompts" / "planner_prompt.txt"
         self.base_prompt_path = project_root / "prompts" / "system_base.txt"
         self._load_prompt_template()
+        
+        logger.info("Planner Loaded")
 
     def _load_prompt_template(self):
-        # Load Base Prompt
-        base_content = ""
-        if self.base_prompt_path.exists():
-            with open(self.base_prompt_path, "r", encoding="utf-8") as f:
-                base_content = f.read() + "\n\n"
-        else:
-            logger.warning(f"System base prompt missing at: {self.base_prompt_path}")
-
-        # Load Planner Specific Prompt
-        if not self.prompt_path.exists():
-            raise FileNotFoundError(f"Planner prompt missing at: {self.prompt_path}")
-        
-        with open(self.prompt_path, "r", encoding="utf-8") as f:
-            # Prepend base prompt to the planner prompt
-            self.system_prompt_template = f.read() + base_content
+        try:
+            self.planner_prompt_template = self.prompt_path.read_text(encoding='utf-8')
+            self.base_system_prompt = self.base_prompt_path.read_text(encoding='utf-8')
+        except Exception as e:
+            logger.error(f"Failed to load prompts: {e}")
+            self.planner_prompt_template = "Draft a plan for: {USER_QUERY}"
+            self.base_system_prompt = "You are an AI planner."
 
     def generate_plan(
         self, 
         user_query: str, 
-        chat_history: str = "None",
-        external_feedback: Optional[str] = None,
-        max_loops: int = 2 
+        chat_history: str = "",
+        external_feedback: Optional[str] = None
     ) -> PlanSchema:
         """
-        Generates a Plan with an internal self-correction loop.
-        Ensures the final plan is executable (RETRIEVE/REASON) rather than passive (CLARIFY).
+        Public entry point: Orchestrates Drafting -> Critiquing -> Refinement.
+        Includes a final sanitization layer to remove unsupported actions.
         """
-        # --- Input Sanitization ---
-        chat_history = chat_history if chat_history is not None else "None"
-       
-        # 1. Refine Query 
-        active_query = user_query
-        if REFINER_AVAILABLE and not external_feedback:
-            logger.info("Refining query for Planner context...")
-            active_query = refine_query_for_planner(user_query, chat_history)
-
-        current_feedback = external_feedback if external_feedback else "None"
-        candidate_plan = None
+        logger.info("=== Planner Started ===")
         
-        # Self-Correction Loop
-        for i in range(max_loops):
-            is_refinement = (i > 0) or (current_feedback != "None")
-            mode = "REFINEMENT" if is_refinement else "DRAFTING"
-            
-            logger.info(f"Planner Iteration {i+1}/{max_loops}: {mode}")
+        try:
+            # 0. Refine Query (Added Step)
+            # Clarify the user's intent using history before planning
+            refined_query = refine_query_for_planner(user_query, chat_history) + "\n" + user_query
+            logger.info(f"Planner processing refined query: {refined_query}")
 
-            # A. Generate Draft / Refinement
-            candidate_plan = self._draft_plan(
-                query=active_query, 
-                history=chat_history, 
-                feedback=current_feedback,
-                prev_plan_json=candidate_plan.model_dump_json() if candidate_plan else "None"
-            )
-
-            # B. Internal Critique (Self-Reflection)
-            if i == max_loops - 1:
-                logger.info("Max iterations reached. Returning current plan.")
-                return candidate_plan
-
-            # Check if Plan lazily asks for clarification
-            has_clarify = any(
-                (step.action == ActionType.CLARIFY or str(step.action).lower() == "clarify") 
-                for step in candidate_plan.steps
-            )
-
-            # If the plan relies on CLARIFY, force the critique to address it
-            critique_instruction = "None"
-            if has_clarify:
-                critique_instruction = (
-                    "CRITICAL CHECK: The plan contains CLARIFY steps. "
-                    "The Planner must resolve ambiguity internally. "
-                    "Critique should demand conversion of CLARIFY into specific RETRIEVE queries "
-                    "unless the query is totally incoherent."
-                )
-
-            critique = self._generate_critique(
-                active_query, 
-                candidate_plan, 
+            # 1. Draft Candidate Plan (Using Refined Query)
+            candidate_plan = self._generate_plan(
+                refined_query, 
                 chat_history, 
-                override_instruction=critique_instruction
+                external_feedback
             )
+
+            # 2. Critique the Plan
+            critique = self._critique_plan(refined_query, candidate_plan)
             
-            if critique.validity == PlanValidity.VALID and not has_clarify:
-                logger.info("Internal Critique passed. Plan is valid.")
-                return candidate_plan
-            else:
-                reason = critique.critique
-                if has_clarify:
-                    reason = f"Plan contained lazy CLARIFY steps. {critique.critique}"
-                
-                logger.warning(f"Internal Critique failed: {reason}")
-                
-                # Update feedback for the next loop
-                current_feedback = (
-                    f"Critique: {reason}\n"
-                    f"Required Fix: {critique.suggestions}\n"
-                    f"Instruction: Replace CLARIFY with specific RETRIEVE steps to find the answer."
-                )
-
-        return candidate_plan
-
-    def _draft_plan(self, query: str, history: str, feedback: str, prev_plan_json: str) -> PlanSchema:
-        """Helper to call the LLM for plan generation/refinement."""
-        # Prepare Prompt
-        system_prompt = self.system_prompt_template.replace("{USER_QUERY}", query)
-        system_prompt = system_prompt.replace("{CHAT_HISTORY}", history)
-        system_prompt = system_prompt.replace("{CANDIDATE_PLAN}", prev_plan_json) 
-        system_prompt = system_prompt.replace("{FEEDBACK}", feedback)
-
-        try:
-            temp = 0.4 if feedback != "None" else 0.2
-            user_prompt_str = "GENERATE EXECUTABLE PLAN (Prioritize RETRIEVE/REASON over CLARIFY)" if feedback == "None" else "REFINE PLAN"
+            final_plan = candidate_plan
             
-            response_text = generate_secondary(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt_str,
-                response_schema=PlanSchema,
-                max_tokens=TOKEN_BUDGETS.get("PLANNER_OUTPUT_MAX", 400),
-                temperature=temp
-            )
+            # 3. Refine if Invalid
+            if critique.validity != PlanValidity.VALID:
+                logger.info(f"Refining plan. Critique: {critique.critique}")
+                final_plan = self._refine_plan(refined_query, candidate_plan, critique, chat_history)
             
-            data = safe_json_load(response_text)
-            if not data: raise ValueError("Empty model response")
+            # 4. Sanitization & Re-indexing
+            # STRICT FILTER: Ensure only RETRIEVE or REASON actions exist.
+            valid_steps = []
+            for step in final_plan.steps:
+                if step.action in [ActionType.RETRIEVE, ActionType.REASON]:
+                    valid_steps.append(step)
+                else:
+                    logger.warning(f"Sanitizing plan: Removing unsupported action '{step.action}'")
 
-            # --- CRITICAL FIX: Sanitize Action Enums ---
-            # Ensures LLM output matches ActionType(str, Enum) values exactly
-            if "steps" in data and isinstance(data["steps"], list):
-                for step in data["steps"]:
-                    if "action" in step and isinstance(step["action"], str):
-                        raw_action = step["action"].lower().strip()
-                        
-                        # Direct Map
-                        if raw_action in ["retrieve", "search", "lookup", "find"]:
-                            step["action"] = "retrieve"
-                        elif raw_action in ["reason", "analyze", "think", "calc"]:
-                            step["action"] = "reason"
-                        elif raw_action in ["clarify", "ask", "question"]:
-                            step["action"] = "clarify"
-                        elif raw_action in ["verify", "check", "audit"]:
-                            step["action"] = "verify"
-                        elif raw_action in ["refuse", "deny", "reject"]:
-                            step["action"] = "refuse"
-                        else:
-                            # Smart Fallback: If totally unknown, default to RETRIEVE
-                            # This prevents the agent from crashing on a made-up action
-                            logger.warning(f"Sanitizing unknown action '{raw_action}' to 'retrieve'")
-                            step["action"] = "retrieve"
-            # ---------------------------------------------
-            
-            return PlanSchema.model_validate(data)
-            
-        except Exception as e:
-            logger.error(f"Planning draft failed: {e}")
-            return self._fallback_plan(query)
+            final_plan.steps = valid_steps
 
-    def _generate_critique(self, query: str, plan: PlanSchema, history: str, override_instruction: str = "None") -> PlanCritique:
-        """
-        Uses the Primary Model to judge the plan. 
-        Enforces that the plan must be executable by the Thinker (RETRIEVE/REASON).
-        """
-        logger.info("Planner requesting Internal Critique...")
-        
-        plan_json = plan.model_dump_json(indent=2)
-        
-        system_prompt = self.system_prompt_template.replace("{USER_QUERY}", query)
-        system_prompt = system_prompt.replace("{CHAT_HISTORY}", history)
-        system_prompt = system_prompt.replace("{CANDIDATE_PLAN}", plan_json)
-        
-        # If we have a specific instruction (like catching CLARIFY), inject it into the feedback slot
-        # to guide the Critic's prompt context
-        context_instruction = "None"
-        if override_instruction != "None":
-            context_instruction = override_instruction
+            # Re-index step IDs to be sequential after filtering
+            for i, step in enumerate(final_plan.steps):
+                step.step_id = i + 1
 
-        system_prompt = system_prompt.replace("{FEEDBACK}", context_instruction)
+            if not final_plan.steps:
+                logger.warning("Plan was empty after sanitization. Injecting fallback retrieval step.")
+                final_plan.steps = [
+                    PlanStep(
+                        step_id=1, 
+                        action=ActionType.RETRIEVE, 
+                        query=f"{user_query}", 
+                        status="pending"
+                    ),
+                    PlanStep(
+                        step_id=2, 
+                        action=ActionType.REASON, 
+                        query="Synthesize findings based on retrieved context.", 
+                        status="pending"
+                    )
+                ]
 
-        try:
-            response_text = generate_primary(
-                system_prompt=system_prompt,
-                user_prompt="PERFORM MODE B: CRITIQUE. Ensure steps are strictly RETRIEVE or REASON.",
-                response_schema=PlanCritique,
-                max_tokens=300,
-                temperature=0.1 
-            )
-            
-            data = safe_json_load(response_text)
-            if not data: raise ValueError("Empty critique response")
-            return PlanCritique.model_validate(data)
+            return final_plan
 
         except Exception as e:
-            logger.error(f"Critique generation failed: {e}")
-            return PlanCritique(
-                validity=PlanValidity.VALID, 
-                critique="Critique generation failed.", 
-                suggestions="None"
+            logger.error(f"Planning failed: {e}")
+            return self._fallback_plan(user_query)
+
+    def _generate_plan(self, query: str, history: str, feedback: Optional[str]) -> PlanSchema:
+        """Internal drafting method."""
+        token_limit = TOKEN_BUDGETS.get("PLANNER_OUTPUT_MAX", 400)
+        user_prompt = self.planner_prompt_template.replace("{USER_QUERY}", query)
+        user_prompt = user_prompt.replace("{CANDIDATE_PLAN}", "None") 
+        user_prompt = user_prompt.replace("{CHAT_HISTORY}", history if history else "None")
+        user_prompt = user_prompt.replace("{FEEDBACK}", feedback if feedback else "None")
+        
+        # INJECT STRICT RETRIEVAL MANDATE
+        user_prompt += (
+            "\n\nCONSTRAINT: You must strictly use ONLY 'retrieve' or 'reason' actions.\n"
+            "PRIMARY RULE: If the user query asks for ANY facts, figures, financial results, dates, or external information, "
+            "your FIRST step MUST be 'retrieve'.\n"
+            "Do NOT use 'reason' to assume data is unavailable or to explain why you can't answer.\n"
+            "ALWAYS attempt to 'retrieve' first.\n"
+            "Only use 'reason' as the first step for purely creative tasks (e.g., 'write a poem' with no data requirements).\n"
+            f"EFFICIENCY: Keep the plan concise. You have a strict limit of {token_limit} tokens for your output. "
+            "Be direct and avoid verbose thought processes."
+        )
+
+        return self._robust_generation(
+            func=generate_primary, # Planner uses Primary Model
+            system_prompt=self.base_system_prompt,
+            user_prompt=user_prompt,
+            response_model=PlanSchema
+        )
+
+    def _critique_plan(self, query: str, plan: PlanSchema) -> PlanCritique:
+        """Self-Correction Loop."""
+        system_prompt = (
+            "You are a Senior QC Agent. Critique the following plan.\n"
+            "FAIL the plan if the user asked for facts/data but the first step is 'reason' instead of 'retrieve'.\n"
+            "FAIL the plan if it assumes data is unavailable without checking.\n"
+            "Ensure it is logical, efficient, and uses 'thought_process' to explain validation."
+        )
+        
+        plan_json = plan.model_dump_json() if hasattr(plan, 'model_dump_json') else json.dumps(plan)
+        
+        user_prompt = f"Query: {query}\nPlan: {plan_json}\nEvaluate validity."
+
+        return self._robust_generation(
+            func=generate_secondary,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_model=PlanCritique
+        )
+
+    def _refine_plan(self, query: str, plan: PlanSchema, critique: PlanCritique, history: str) -> PlanSchema:
+        """
+        Refinement Step.
+        """
+        plan_json = plan.model_dump_json() if hasattr(plan, 'model_dump_json') else json.dumps(plan)
+        
+        full_feedback = (
+            f"CRITIQUE: {critique.critique}\n"
+            f"REQUIRED FIXES: {critique.suggestions}\n"
+            "REMINDER: If this is a factual query, Step 1 MUST be 'retrieve'."
+        )
+
+        user_prompt = self.planner_prompt_template.replace("{USER_QUERY}", query)
+        user_prompt = user_prompt.replace("{CANDIDATE_PLAN}", plan_json)
+        user_prompt = user_prompt.replace("{CHAT_HISTORY}", history if history else "Refinement Mode")
+        user_prompt = user_prompt.replace("{FEEDBACK}", full_feedback)
+
+        user_prompt += (
+            "\n\nMODE: REFINEMENT. Fix the plan based on the feedback above.\n"
+            "CONSTRAINT: Force 'retrieve' as the first step for data queries."
+        )
+
+        return self._robust_generation(
+            func=generate_primary,
+            system_prompt=self.base_system_prompt,
+            user_prompt=user_prompt,
+            response_model=PlanSchema
+        )
+
+    def _robust_generation(
+        self, 
+        func: callable, 
+        system_prompt: str, 
+        user_prompt: str, 
+        response_model: Type[Any], 
+        max_retries: int = 2
+    ) -> Any:
+        """
+        Gatekeeper: Enforces strict JSON compliance via a 4-Stage Repair Pipeline.
+        """
+        expected_schema_dict = response_model.model_json_schema()
+        expected_schema_str = json.dumps(expected_schema_dict, indent=2)
+        
+        # --- Stage 1: Generation & Standard Validation ---
+        raw_output = func(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_schema=response_model
+        )
+
+        if validate_json_structure(raw_output, expected_schema_str):
+            data = safe_json_load(raw_output)
+            return response_model.model_validate(data)
+        
+        logger.warning("Standard parse failed. Entering 4-Stage Repair Pipeline.")
+
+        # --- Stage 2: Library Repair ---
+        logger.info("Stage 2: Attempting 'json_repair'...")
+        repaired_obj = repair_json(raw_output)
+        
+        if repaired_obj:
+            try:
+                # Re-verify schema compliance
+                if validate_json_structure(json.dumps(repaired_obj), expected_schema_str):
+                    logger.info("Stage 2 Success: JSON repaired via library.")
+                    return response_model.model_validate(repaired_obj)
+            except Exception:
+                pass
+
+        # --- Stage 3: LLM One-Shot Repair ---
+        logger.info("Stage 3: Attempting 'repair_json_with_llm'...")
+        try:
+            repaired_llm_text = repair_json_with_llm(expected_schema_str, raw_output)
+            if validate_json_structure(repaired_llm_text, expected_schema_str):
+                 logger.info("Stage 3 Success: JSON repaired via LLM.")
+                 data = safe_json_load(repaired_llm_text)
+                 return response_model.model_validate(data)
+        except Exception as e:
+            logger.warning(f"Stage 3 failed: {e}")
+
+        # --- Stage 4: Iterative Critique Loop ---
+        logger.warning("Stage 3 failed. Entering Stage 4: Interactive Critique Loop.")
+        
+        current_output = raw_output
+        for attempt in range(max_retries):
+            critique = generate_schema_critique(expected_schema_str, current_output)
+            
+            if not critique:
+                logger.error("Critique generation failed. Aborting loop.")
+                break
+
+            logger.info(f"Critique Loop {attempt+1}/{max_retries}: {critique.critique[:100]}...")
+
+            repair_prompt = (
+                f"### TARGET SCHEMA ###\n{expected_schema_str}\n\n"
+                f"### MALFORMED INPUT ###\n{current_output}\n\n"
+                f"### CRITIQUE ###\n{critique.critique}\n\n"
+                f"### REPAIR INSTRUCTIONS ###\n{critique.suggestions}\n\n"
+                "Generate the fully corrected JSON now. No markdown. No text."
             )
+            
+            # Using generate_secondary (Flash) for fast repairs
+            current_output = generate_secondary(
+                system_prompt="You are a JSON Repair Agent.",
+                user_prompt=repair_prompt,
+                response_schema=response_model 
+            )
+
+            if validate_json_structure(current_output, expected_schema_str):
+                logger.info("Stage 4 Success: JSON repaired via Critique Loop.")
+                data = safe_json_load(current_output)
+                return response_model.model_validate(data)
+
+        logger.error("All repair stages failed. Returning None.")
+        return None
 
     def _fallback_plan(self, query: str) -> PlanSchema:
         logger.warning("Triggering Fallback Plan.")
         return PlanSchema(
+            thought_process="Fallback mechanism triggered due to planning failure.",
             steps=[
-                {
-                    "step_id": 1, 
-                    "action": ActionType.RETRIEVE, 
-                    "query": f"{query}", 
-                    "status": "pending"
-                },
-                {
-                    "step_id": 2, 
-                    "action": ActionType.REASON, 
-                    "query": "Synthesize findings", 
-                    "status": "pending"
-                }
+                PlanStep(
+                    step_id=1, 
+                    action=ActionType.RETRIEVE, 
+                    query=f"{query}", 
+                    status="pending"
+                ),
+                PlanStep(
+                    step_id=2, 
+                    action=ActionType.REASON, 
+                    query="Synthesize findings", 
+                    status="pending"
+                )
             ],
             risk_level="low",
             requires_compliance=False,

@@ -18,9 +18,10 @@ from agent.schemas import Chunk
 # --- Smart Retrieval Imports ---
 try:
     from retrieval.query_refiner import refine_query
-    # We bypass context_compressor to ensure we keep full Chunk objects with metadata
+    from retrieval.context_compressor import compress_context
     SMART_COMPONENTS_AVAILABLE = True
-except ImportError:
+except ImportError as e:
+    logger.warning(f"Smart components import failed: {e}")
     SMART_COMPONENTS_AVAILABLE = False
 
 logger = get_logger("PINECONE_CLIENT")
@@ -108,9 +109,10 @@ def retrieve(
 def smart_retrieve(query: str, chat_history: str = "None") -> List[Chunk]:
     """
     Orchestrates Retrieval.
-    CRITICAL FIX: 
     1. Always includes the RAW query to ensure basic keyword/semantic matching works.
-    2. Returns List[Chunk] (not strings) so Thinker can access IDs.
+    2. Refines query using chat history.
+    3. Fetches chunks.
+    4. Compresses chunks based on the USER QUERY before returning.
     """
     # 1. Fallback if smart components are missing
     if not SMART_COMPONENTS_AVAILABLE:
@@ -121,7 +123,7 @@ def smart_retrieve(query: str, chat_history: str = "None") -> List[Chunk]:
         # We start with the raw query to guarantee at least basic retrieval performance
         queries = [query]
         
-        # Attempt refinement, but do not let it block execution
+        # Attempt refinement
         try:
             refined = refine_query(query, chat_history)
             if refined and isinstance(refined, list):
@@ -143,10 +145,13 @@ def smart_retrieve(query: str, chat_history: str = "None") -> List[Chunk]:
                     all_chunks.append(chunk)
                     seen_ids.add(chunk.id)
         
-        logger.info(f"Smart Retrieve found {len(all_chunks)} unique chunks.")
+        logger.info(f"Smart Retrieve found {len(all_chunks)} unique chunks before compression.")
         
-        # 4. Return Objects (No String Compression)
-        # Thinker needs Chunk objects to extract citations.
+        # 4. Context Compression & Deduplication (Query Aware)
+        # We pass the original user query to ensure compression preserves relevant info
+        if all_chunks:
+            return compress_context(all_chunks, query)
+            
         return all_chunks
 
     except Exception as e:

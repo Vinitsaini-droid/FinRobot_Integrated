@@ -140,6 +140,12 @@ def save_profile(risk: str, depth: str, style: str):
         profile_store.update_profile(new_profile)
         st.success("Profile created successfully!")
         logger.info(f"Profile for '{user_id}' saved to database successfully.")
+        # --- CRITICAL FIX: Clear Resource Cache ---
+        # This forces the MetaAgent to re-initialize on the next run.
+        # It ensures the Agent's internal memory fetches the NEW profile from the DB.
+        st.cache_resource.clear()
+        logger.info("System cache cleared to enforce profile update.")
+        # ------------------------------------------
         time.sleep(1)
         st.session_state.authenticated = True
         st.rerun()

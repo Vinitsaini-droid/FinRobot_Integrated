@@ -1,5 +1,6 @@
 # evaluation/ragas_runner.py
 import sys
+import json
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from pydantic import BaseModel, Field
@@ -10,8 +11,17 @@ project_root = current_dir.parent
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
-from utils.llm_client import generate_secondary, get_embedding
-from utils.json_utils import safe_json_load
+from utils.llm_client import (
+    generate_secondary, 
+    get_embedding, 
+    generate_schema_critique, 
+    repair_json_with_llm
+)
+from utils.json_utils import (
+    safe_json_load, 
+    validate_json_structure, 
+    repair_json
+)
 from utils.similarity import cosine_similarity
 from utils.logger import get_logger
 
@@ -24,6 +34,7 @@ class MetricResult(BaseModel):
 
 class RagasRunner:
     def __init__(self):
+        # Google Type Schema for the API call hint
         self.schema = types.Schema(
             type=types.Type.OBJECT,
             properties={
@@ -34,18 +45,85 @@ class RagasRunner:
             required=["metric_name", "score", "reasoning"]
         )
 
+    def _robust_validate_and_parse(self, raw_text: str, schema_str: str) -> Optional[Dict[str, Any]]:
+        """
+        Helper: Executes the Multi-Stage Repair Pipeline.
+        1. Validate Raw
+        2. Repair Algorithmic (json_repair)
+        3. Repair LLM (repair_json_with_llm)
+        """
+        # Stage 1: Standard Validation
+        if validate_json_structure(raw_text, schema_str):
+            return safe_json_load(raw_text)
+
+        # Stage 2: Algorithmic Repair
+        logger.debug("Stage 1 failed. Attempting algorithmic repair (repair_json)...")
+        repaired_text = repair_json(raw_text)
+        if repaired_text and validate_json_structure(repaired_text, schema_str):
+            return safe_json_load(repaired_text)
+
+        # Stage 3: LLM Repair
+        logger.warning("Stage 2 failed. Attempting LLM-based repair (repair_json_with_llm)...")
+        llm_repaired_text = repair_json_with_llm(schema_str, raw_text)
+        if llm_repaired_text and validate_json_structure(llm_repaired_text, schema_str):
+            return safe_json_load(llm_repaired_text)
+        
+        return None
+
     def _call_metric(self, sys_p: str, usr_p: str) -> MetricResult:
-        res = generate_secondary(sys_p, usr_p, response_schema=self.schema)
-        data = safe_json_load(res)
-        if data:
-            return MetricResult.model_validate(data)
-        return MetricResult(metric_name="error", score=0.0, reasoning="Parsing failure.")
+        """
+        Executes a metric evaluation with self-healing JSON enforcement.
+        """
+        max_retries = 3
+        # Generate strict JSON schema string from Pydantic model
+        expected_schema_str = json.dumps(MetricResult.model_json_schema())
+        
+        current_usr_p = usr_p
+
+        for attempt in range(max_retries):
+            try:
+                # 1. Generate Response
+                res = generate_secondary(sys_p, current_usr_p, response_schema=self.schema)
+                
+                # 2. Multi-Stage Validation & Repair
+                data = self._robust_validate_and_parse(res, expected_schema_str)
+
+                if data:
+                    return MetricResult.model_validate(data)
+                
+                # --- REPAIR LOOP START (Critique Fallback) ---
+                logger.warning(f"Attempt {attempt + 1}/{max_retries}: All repair stages failed. Initiating critique loop.")
+                
+                # Generate Critique
+                critique_obj = generate_schema_critique(
+                    expected_schema_str=expected_schema_str,
+                    received_output_str=res
+                )
+                
+                if critique_obj:
+                    # Update Prompt with Feedback
+                    current_usr_p = (
+                        f"{usr_p}\n\n"
+                        f"### PREVIOUS ATTEMPT FAILED ###\n"
+                        f"Your previous JSON output was invalid.\n"
+                        f"Critique: {critique_obj.critique}\n"
+                        f"Correction Instructions: {critique_obj.suggestions}\n"
+                        f"Please try again, strictly adhering to the schema."
+                    )
+                else:
+                    current_usr_p = f"{usr_p}\n\nPlease ensure strict JSON formatting."
+                
+                # --- REPAIR LOOP END ---
+                
+            except Exception as e:
+                logger.error(f"Ragas Metric Failure (Attempt {attempt}): {e}")
+
+        return MetricResult(metric_name="error", score=0.0, reasoning="Parsing failure after retries.")
 
     def evaluate_faithfulness(self, context: List[str], answer: str) -> MetricResult:
         prompt = f"Is the answer grounded in context? Context: {' '.join(context)} | Answer: {answer}"
         return self._call_metric("Evaluation: Faithfulness (0-1)", prompt)
 
-    # UPDATED: Added chat_history for context-aware relevance
     def evaluate_answer_relevance(self, query: str, answer: str, chat_history: Optional[str] = None) -> MetricResult:
         context_str = f"Chat History: {chat_history}\n" if chat_history else ""
         prompt = (
@@ -64,7 +142,6 @@ class RagasRunner:
             logger.error(f"Sim-Eval Error: {e}")
             return MetricResult(metric_name="semantic_similarity", score=0.0, reasoning="Vector error.")
 
-    # UPDATED: Accept chat_history in the orchestration loop
     def run_full_evaluation(self, query: str, context: List[str], answer: str, chat_history: Optional[str] = None) -> Dict[str, Any]:
         logger.info("Initiating RAG evaluation cycle...")
         

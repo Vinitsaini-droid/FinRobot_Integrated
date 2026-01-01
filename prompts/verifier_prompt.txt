@@ -35,17 +35,3 @@ Your goal is to accept only truth and reject hallucinations or safety risks.
 - RISKY: Factually true but misses tone, risk warnings, or has weak evidence.
 - FAIL: Hallucination, math error, safety violation, or logic failure.
 
---- OUTPUT FORMAT (JSON ONLY) ---
-{
-  "verification_status": "PASS" | "RISKY" | "FAIL",
-  "critique": "Specific explanation of what went wrong. Be granular.",
-  "suggested_correction": "Exact rewording or instruction for the Thinker.",
-  "confidence_score": 0.0 to 1.0,
-  "xai_citations": [
-    {
-      "claim": "The exact sentence being checked",
-      "evidence_ids": ["1", "3"],
-      "verdict": "SUPPORTED" | "UNSUPPORTED" | "CONTRADICTED"
-    }
-  ]
-}

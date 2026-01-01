@@ -1,8 +1,8 @@
-# agent/thinker.py
 import sys
 import json
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Type
 from pathlib import Path
+from pydantic import BaseModel, Field
 
 # --- Path Setup ---
 current_dir = Path(__file__).resolve().parent
@@ -14,60 +14,151 @@ from agent.schemas import (
     PlanSchema, 
     ThinkerOutput, 
     ActionType,
-    Chunk
+    Chunk,
+    ReasoningTrace
 )
-from config.token_budgets import TOKEN_BUDGETS
-from utils.llm_client import generate_primary
-from utils.json_utils import safe_json_load
+from utils.llm_client import (
+    generate_primary, 
+    generate_schema_critique,
+    repair_json_with_llm 
+)
+from utils.json_utils import (
+    safe_json_load, 
+    validate_json_structure,
+    repair_json 
+)
 from utils.logger import get_logger
+from config.token_budgets import TOKEN_BUDGETS
 
 # --- Smart Retrieval Layer Integration ---
 try:
     from retrieval.pinecone_client import smart_retrieve
     RETRIEVAL_AVAILABLE = True
-except ImportError as e:
+except ImportError:
+    # Minimal fallback logger setup if imports fail
     logger = get_logger("THINKER")
-    logger.error(f"CRITICAL: Retrieval import failed. Thinker is blind. Error: {e}")
+    logger.warning("Retrieval import failed. Thinker is operating without external memory.")
     RETRIEVAL_AVAILABLE = False
     def smart_retrieve(*args, **kwargs): return []
 
 logger = get_logger("THINKER")
 
+# --- Internal Schema for LLM Generation ---
+# Separates reasoning (LLM side) from serialization (System side).
+class ThinkerSynthesis(BaseModel):
+    thought_process: str = Field(..., description="Acts as a thought space for reasoning models")
+    draft_answer: str
+    key_facts_extracted: List[str]
+    confidence_score: float
+    missing_information: Optional[str]
+    xai_trace: str
+
 class Thinker:
     """
     The Executor: Handles Answer Synthesis and Verification Refinement Loops.
     Strictly executes the Plan provided by the Planner (RETRIEVE/REASON).
-    Does NOT handle Clarification or Plan Refinement.
     """
     def __init__(self):
         self.prompt_path = project_root / "prompts" / "thinker_prompt.txt"
         self.base_prompt_path = project_root / "prompts" / "system_base.txt"
         self._load_prompt_template()
+        logger.info("Thinker Initialized")
 
     def _load_prompt_template(self):
-        # Load Base Prompt
-        base_content = ""
-        if self.base_prompt_path.exists():
-             with open(self.base_prompt_path, "r", encoding="utf-8") as f:
-                base_content = f.read() + "\n\n"
-        else:
-            logger.warning(f"System base prompt missing at: {self.base_prompt_path}")
+        try:
+            self.base_system_prompt = self.base_prompt_path.read_text(encoding='utf-8')
+            self.thinker_prompt_template = self.prompt_path.read_text(encoding='utf-8')
+        except Exception as e:
+            logger.error(f"Failed to load prompts: {e}")
+            self.base_system_prompt = "You are the Thinker Agent."
+            self.thinker_prompt_template = "Context: {CONTEXT_CHUNKS}\nQuery: {USER_QUERY}"
 
-        # Load Thinker Specific Prompt
-        if not self.prompt_path.exists():
-            # Fallback if file is missing, though file creation is preferred
-            raise FileNotFoundError(f"Thinker prompt not found at {self.prompt_path}")
+    def _robust_generation(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        response_model: Type[BaseModel],
+        max_retries: int = 2
+    ) -> Dict[str, Any]:
+        """
+        Gatekeeper Layer: Enforces strict JSON schema compliance.
+        Pipeline: Validate -> Library Repair -> LLM Repair -> Critique Loop.
+        """
+        current_prompt = user_prompt
+        expected_schema_dict = response_model.model_json_schema()
+        expected_schema_json = json.dumps(expected_schema_dict, indent=2)
+
+        for attempt in range(max_retries + 1):
+            # 1. Generate Raw Output
+            raw_response = generate_primary(
+                system_prompt=system_prompt,
+                user_prompt=current_prompt,
+                response_schema=response_model 
+            )
+
+            # --- Stage 1: Standard Validation ---
+            if validate_json_structure(raw_response, expected_schema_json):
+                parsed_json = safe_json_load(raw_response)
+                if parsed_json:
+                    return parsed_json
+
+            # --- Stage 2: Library Repair (json_repair) ---
+            logger.warning(f"Stage 1 Failed. Attempting Library Repair (Attempt {attempt + 1})")
+            repaired_obj = repair_json(raw_response)
+            if repaired_obj:
+                # Validate the repaired object against schema
+                if validate_json_structure(json.dumps(repaired_obj), expected_schema_json):
+                    logger.info("Stage 2 Success: JSON repaired via library.")
+                    return repaired_obj
+
+            # --- Stage 3: LLM One-Shot Repair ---
+            logger.warning("Stage 2 Failed. Attempting LLM Repair.")
+            try:
+                repaired_text = repair_json_with_llm(expected_schema_json, raw_response)
+                
+                if repaired_text and validate_json_structure(repaired_text, expected_schema_json):
+                    logger.info("Stage 3 Success: JSON repaired via LLM.")
+                    return safe_json_load(repaired_text)
+            except Exception as e:
+                logger.error(f"Stage 3 error: {e}")
+
+            # --- Stage 4: Critique & Loop (Fallback) ---
+            logger.warning("Stage 3 Failed. Entering Critique Loop.")
+            
+            if attempt < max_retries:
+                critique = generate_schema_critique(
+                    expected_schema_str=expected_schema_json,
+                    received_output_str=raw_response
+                )
+                
+                if critique:
+                    feedback = (
+                        f"\n\n<SYSTEM_FEEDBACK>\n"
+                        f"CRITIQUE: {critique.critique}\n"
+                        f"SUGGESTION: {critique.suggestions}\n"
+                        f"Ensure strict adherence to the schema:\n{expected_schema_json}\n"
+                        f"</SYSTEM_FEEDBACK>"
+                    )
+                    current_prompt += feedback
+                else:
+                    current_prompt += f"\n\nError parsing JSON. Ensure output matches:\n{expected_schema_json}"
         
-        with open(self.prompt_path, "r", encoding="utf-8") as f:
-            # Prepend base prompt to the thinker prompt
-            self.system_prompt_template = f.read() + base_content
+        logger.error("Thinker failed to generate valid JSON after all repair stages.")
+        # Fail-safe fallback matching ThinkerSynthesis
+        return {
+            "thought_process": "System Failure: Unable to generate valid JSON.",
+            "draft_answer": "I encountered an internal error while processing the data.",
+            "key_facts_extracted": [],
+            "confidence_score": 0.0,
+            "missing_information": "JSON Schema Validation Failed",
+            "xai_trace": "Error during generation."
+        }
 
     def execute_plan(
-        self, 
-        user_query: str, 
-        plan: PlanSchema, 
+        self,
+        user_query: str,
+        plan: PlanSchema,
         chat_history: str = "None",
-        existing_context: str = "None",
         previous_draft: str = "None",
         verifier_feedback: str = "None"
     ) -> ThinkerOutput:
@@ -77,169 +168,154 @@ class Thinker:
         logger.info(f"=== THINKER EXECUTION START ===")
         logger.info(f"Incoming User Query: '{user_query}'")
         logger.info(f"Plan Steps: {len(plan.steps)}")
-        
+
         # Input Sanitization
         chat_history = str(chat_history) if chat_history is not None else "None"
-        existing_context = str(existing_context) if existing_context is not None else "None"
+        previous_draft = str(previous_draft) if previous_draft is not None else "None"
+        verifier_feedback = str(verifier_feedback) if verifier_feedback is not None else "None"
         
         retrieved_chunks: List[Chunk] = []
         execution_log: List[str] = []
         
-        # SYSTEM TRACE COLLECTOR: Captures hard evidence for the Verifier
-        # Must strictly match ReasoningTrace schema
-        system_traces: List[Dict[str, Any]] = []
+        # SYSTEM TRACE COLLECTOR: Captures hard evidence for the Verifier manually
+        system_traces: List[ReasoningTrace] = []
 
         # --- 1. Execute Actions (Strict Execution) ---
-        for i, step in enumerate(plan.steps):
-            # 1. Normalize Action String for Comparison
-            if hasattr(step.action, 'value'):
-                action_str = str(step.action.value).upper()
-            else:
-                action_str = str(step.action).upper()
-            
-            # Constants for Enum comparison
-            target_retrieve = str(ActionType.RETRIEVE.value).upper()
-            target_reason = str(ActionType.REASON.value).upper()
+        target_retrieve = ActionType.RETRIEVE.value.upper()
+        target_reason = ActionType.REASON.value.upper()
 
-            logger.info(f"[Step {i+1}] Action: '{action_str}' | Query: '{step.query}'")
+        for step in plan.steps:
+            try:
+                # Handle Enum or String input for Action
+                action_str = step.action.value.upper() if hasattr(step.action, 'value') else str(step.action).upper()
+                logger.info(f"Step {step.step_id}: {action_str} - {step.query}")
 
-            # 2. Execute based on ActionType
-            if action_str == target_retrieve or action_str == "RETRIEVE":
-                if RETRIEVAL_AVAILABLE:
-                    logger.info(f"--> RETRIEVAL TRIGGERED | Query: '{step.query}'")
-                    try:
-                        results = smart_retrieve(step.query, chat_history)
+                if action_str == target_retrieve:
+                    # Execute Retrieval
+                    if RETRIEVAL_AVAILABLE:
+                        chunks = smart_retrieve(step.query)
+                        count = len(chunks) if chunks else 0
                         
-                        if results:
-                            retrieved_chunks.extend(results)
-                            msg = f"✓ Retrieved {len(results)} chunks for query: '{step.query}'"
-                            execution_log.append(msg)
-                            logger.info(msg)
-                            
-                            # --- EVIDENCE CAPTURE START ---
-                            # Capture the actual content so Verifier can see it in reasoning_traces.
-                            evidence_text = "\n".join([f"[Source {c.id}]: {c.text}" for c in results])
-                            
-                            # Create a valid ReasoningTrace dict
-                            system_trace = {
-                                "step_id": i + 1,  # Must be INT
-                                "action": "retrieve", # Matches ActionType.RETRIEVE
-                                "query": step.query,
-                                "thought": f"System executed retrieval for query: {step.query}", # Required field
-                                "observation": evidence_text
-                            }
-                            system_traces.append(system_trace)
-                            # --- EVIDENCE CAPTURE END ---
+                        if count > 0:
+                            retrieved_chunks.extend(chunks)
+                            execution_log.append(f"Step {step.step_id} (RETRIEVE): Retrieved {count} chunks.")
+                            system_traces.append(ReasoningTrace(
+                                step_id=step.step_id,
+                                action=ActionType.RETRIEVE,
+                                query=step.query,
+                                thought="Executing Retrieval via Pinecone",
+                                observation=f"Found {count} documents."
+                            ))
                         else:
-                            msg = f"⚠ Retrieval returned 0 results for query: '{step.query}'"
-                            execution_log.append(msg)
-                            logger.warning(msg)
-                    except Exception as e:
-                        err_msg = f"❌ Error inside smart_retrieve: {e}"
-                        logger.error(err_msg)
-                        execution_log.append(err_msg)
-                else:
-                    execution_log.append("⚠ Retrieval unavailable (Import Failed).")
+                            execution_log.append(f"Step {step.step_id} (RETRIEVE): No results found.")
+                            system_traces.append(ReasoningTrace(
+                                step_id=step.step_id,
+                                action=ActionType.RETRIEVE,
+                                query=step.query,
+                                thought="Executing Retrieval via Pinecone",
+                                observation="No documents found."
+                            ))
+                    else:
+                        execution_log.append(f"Step {step.step_id} (RETRIEVE): Skipped (Retrieval Unavailable).")
 
-            elif action_str == target_reason or action_str == "REASON":
-                msg = f"ℹ Logic/Reasoning Step: {step.query}"
-                execution_log.append(msg)
-                logger.debug("Processing reasoning step (Internal Monologue).")
+                elif action_str == target_reason:
+                    # Log Reasoning intent (actual reasoning happens in synthesis)
+                    execution_log.append(f"Step {step.step_id} (REASON): Planned logic - {step.query}")
+                    system_traces.append(ReasoningTrace(
+                        step_id=step.step_id,
+                        action=ActionType.REASON,
+                        query=step.query,
+                        thought="Planned internal reasoning step",
+                        observation="Pending synthesis..."
+                    ))
                 
-            else:
-                logger.debug(f"Thinker skipping non-executable action: {action_str}")
+                else:
+                    logger.warning(f"Step {step.step_id}: Unknown or unsupported action '{action_str}' encountered. Skipping.")
 
-        # --- 2. Context Construction ---
-        # Deduplicate chunks by ID
-        unique_chunks_map = {c.id: c for c in retrieved_chunks}
-        unique_chunks = list(unique_chunks_map.values())
-        
-        logger.info(f"Total Unique Chunks passed to Context: {len(unique_chunks)}")
+            except Exception as e:
+                logger.error(f"Error executing step {step.step_id}: {e}")
+                execution_log.append(f"Step {step.step_id}: FAILED ({str(e)})")
 
-        new_evidence_text = "\n\n".join([f"Source {c.id}: {c.text}" for c in unique_chunks])
-        
-        context_blocks = []
-        if new_evidence_text:
-            context_blocks.append(f"=== NEWLY RETRIEVED EVIDENCE ===\n{new_evidence_text}")
-        
-        if existing_context and existing_context != "None":
-            context_blocks.append(f"=== PREVIOUS CONTEXT ===\n{existing_context}")
+        # --- 2. Context Preparation & Serialization ---
+        # Serialize Plan for the Prompt
+        plan_json = plan.model_dump_json() if hasattr(plan, 'model_dump_json') else json.dumps(plan, default=str)
 
-        if not context_blocks:
-            chunks_text = "NO EXTERNAL EVIDENCE FOUND."
-            logger.warning("Thinker context is empty. No evidence found or passed.")
+        # Merge Retrieved Chunks into {CONTEXT_CHUNKS}
+        context_parts = []
+        
+        if retrieved_chunks:
+            # Simple dedup based on ID if available
+            seen_ids = set()
+            unique_chunks = []
+            for c in retrieved_chunks:
+                if c.id not in seen_ids:
+                    unique_chunks.append(c)
+                    seen_ids.add(c.id)
+            
+            chunk_text = "\n".join([f"[{c.id}] {c.text}" for c in unique_chunks])
+            context_parts.append(f"--- RETRIEVED EVIDENCE ---\n{chunk_text}")
         else:
-            chunks_text = "\n\n".join(context_blocks)
-
-        # --- 3. Prompt Synthesis ---
-        system_prompt = self.system_prompt_template
-        replacements = {
-            "{USER_QUERY}": user_query,
-            "{CONTEXT_CHUNKS}": chunks_text,
-            "{EXECUTION_LOG}": "\n".join(execution_log),
-            "{PREVIOUS_DRAFT}": previous_draft or "None",
-            "{VERIFIER_FEEDBACK}": verifier_feedback or "None"
-        }
+            context_parts.append("No external evidence found.")
         
-        for placeholder, value in replacements.items():
-            system_prompt = system_prompt.replace(placeholder, str(value))
+        final_context_str = "\n\n".join(context_parts)
+        final_exec_log_str = "\n".join(execution_log)
+        token_limit = TOKEN_BUDGETS.get("THINKER_DRAFT_MAX", 1500)
 
+        # --- 3. Prompt Engineering ---
+        # Strictly replacing placeholders defined in thinker_prompt.txt
+        user_prompt = self.thinker_prompt_template.replace("{USER_QUERY}", user_query)
+        user_prompt = user_prompt.replace("{CHAT_HISTORY}", chat_history)
+        user_prompt = user_prompt.replace("{PLAN_JSON}", plan_json)
+        user_prompt = user_prompt.replace("{CONTEXT_CHUNKS}", final_context_str)
+        user_prompt = user_prompt.replace("{EXECUTION_LOG}", final_exec_log_str)
+        user_prompt = user_prompt.replace("{PREVIOUS_DRAFT}", previous_draft)
+        user_prompt = user_prompt.replace("{VERIFIER_FEEDBACK}", verifier_feedback)
+        user_prompt += f"\n\nCONSTRAINT: Keep the draft_answer concise (approx {token_limit} tokens)."
+
+        # --- 4. Robust Generation ---
+        synthesis_data = self._robust_generation(
+            system_prompt=self.base_system_prompt,
+            user_prompt=user_prompt,
+            response_model=ThinkerSynthesis 
+        )
+
+        # --- 5. Final Assembly (Manual Trace Injection & Score Normalization) ---
         try:
-            response_text = generate_primary(
-                system_prompt=system_prompt,
-                user_prompt=f"Synthesize the answer for: {user_query}",
-                response_schema=ThinkerOutput,
-                max_tokens=TOKEN_BUDGETS.get("THINKER_DRAFT_MAX", 1500),
-                temperature=0.1 
+            # Normalize Confidence Score (0.0 - 1.0)
+            raw_score = synthesis_data.get("confidence_score", 0.0)
+            if raw_score > 1.0:
+                raw_score = raw_score / 100.0
+            
+            # Clamp strictly between 0 and 1
+            final_score = max(0.0, min(1.0, raw_score))
+            synthesis_data["confidence_score"] = final_score
+
+            # Convert dict back to model to validate fields
+            synthesis_model = ThinkerSynthesis(**synthesis_data)
+            
+            # Construct Final Output by merging LLM thoughts with Manual System Traces
+            final_output = ThinkerOutput(
+                thought_process=synthesis_model.thought_process,
+                draft_answer=synthesis_model.draft_answer,
+                key_facts_extracted=synthesis_model.key_facts_extracted,
+                confidence_score=synthesis_model.confidence_score,
+                retrieved_context=final_context_str,
+                missing_information=synthesis_model.missing_information,
+                reasoning_traces=system_traces, # INJECTED MANUALLY from execution loop
+                xai_trace=synthesis_model.xai_trace
             )
             
-            data = safe_json_load(response_text)
-            if not data:
-                raise ValueError("LLM returned empty JSON.")
-            
-            # --- CRITICAL FIX: Merge System Traces with LLM Traces ---
-            if "reasoning_traces" not in data:
-                data["reasoning_traces"] = []
-            
-            # Prepend system traces (Hard Evidence) to LLM traces (Reasoning)
-            # This ensures the Verifier sees the actual retrieval data.
-            data["reasoning_traces"] = system_traces + data["reasoning_traces"]
-            
-            # --- CRITICAL FIX: Sanitize Traces ---
-            # Ensure every trace meets the Pydantic Schema requirements
-            if isinstance(data["reasoning_traces"], list):
-                valid_actions = {a.value for a in ActionType}
-                
-                for idx, trace in enumerate(data["reasoning_traces"]):
-                    if isinstance(trace, dict):
-                        # 1. Ensure step_id is an INT
-                        if "step_id" not in trace or trace["step_id"] is None:
-                            trace["step_id"] = idx + 1
-                        else:
-                            try:
-                                trace["step_id"] = int(trace["step_id"])
-                            except:
-                                trace["step_id"] = idx + 1
-
-                        # 2. Ensure Action is Valid
-                        current_action = str(trace.get("action", "")).lower()
-                        if current_action not in valid_actions:
-                            # Map to safe fallback
-                            trace["action"] = ActionType.REASON.value
-                        
-                        # 3. Ensure 'thought' exists (Required field)
-                        if "thought" not in trace or not trace["thought"]:
-                            trace["thought"] = "Processing step..."
-
-            return ThinkerOutput.model_validate(data)
+            logger.info("Thinker Execution Complete. Traces merged and score normalized.")
+            return final_output
 
         except Exception as e:
-            logger.error(f"Thinker Execution/Synthesis failed: {e}")
+            logger.error(f"Failed to assemble final ThinkerOutput: {e}")
             return ThinkerOutput(
-                draft_answer=f"I encountered an error during analysis: {str(e)}",
+                thought_process="Assembly Error",
+                draft_answer="Error assembling final response.",
                 key_facts_extracted=[],
                 confidence_score=0.0,
-                missing_information="System Error",
+                missing_information=f"System Error: {str(e)}",
                 reasoning_traces=[],
-                xai_trace="Error trace"
+                xai_trace="Error"
             )

@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     SECONDARY_MODEL: str = Field(default="gemini-2.5-flash")
     EMBEDDING_MODEL: str = Field(default="text-embedding-004")
 
+    # --- JSON VALIDITY CHECKER---
+    JSON_VALIDATOR: str = Field(default="gemini-flash-lite-latest")
+
     # --- Pinecone / Vector DB Config ---
     PINECONE_API_KEY: str = Field(...)
     PINECONE_ENVIRONMENT: str = Field(...)
