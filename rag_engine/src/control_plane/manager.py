@@ -287,6 +287,16 @@ class ControlPlaneManager:
         """Index all data for a ticker to Pinecone."""
         from src.indexing.upsert_pinecone import index_all_data
         index_all_data(ticker)
+        
+        # Trigger Semantic Cache Invalidation
+        try:
+            from retrieval.semantic_cache import clear_cache
+            clear_cache()
+            print("[ControlPlane] Semantic cache cleared.")
+        except ImportError:
+            pass # Ignore if cache module not available
+        except Exception as e:
+            print(f"[ControlPlane] Warning: Failed to clear semantic cache: {e}")
 
     def _index_component(self, ticker: str, component: str) -> None:
         """

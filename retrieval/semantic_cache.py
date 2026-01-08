@@ -12,7 +12,13 @@ if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
 from retrieval.pinecone_client import index
-from utils.llm_client import get_embedding
+# Use RAG engine's embedding logic to ensure compatibility
+try:
+    from rag_engine.src.embeddings.embedding_provider import embed_query
+except ImportError:
+    # Fallback or error if RAG not available
+    def embed_query(text): return []
+
 from utils.logger import get_logger
 from agent.schemas import PlanSchema, ThinkerOutput, VerificationReport
 
@@ -46,7 +52,8 @@ def store_cache(
         return
 
     try:
-        vector = get_embedding(query)
+        # Use RAG embedding
+        vector = embed_query(query)
         if not vector: return
 
         # Serialize artifacts to JSON strings (Pinecone metadata must be flat)
@@ -80,8 +87,8 @@ def retrieve_cache(query: str) -> Optional[Dict[str, Any]]:
     if not index or not query: return None
 
     try:
-        query_vector = get_embedding(query)
-        if not query_vector: return None
+        vector = embed_query(query)
+        if not vector: return
 
         # Query Pinecone without profile filters
         results = index.query(

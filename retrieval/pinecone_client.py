@@ -11,9 +11,18 @@ if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
 from config.settings import settings
-from utils.llm_client import get_embedding
 from utils.logger import get_logger
 from agent.schemas import Chunk
+
+# Import rag_engine components
+try:
+    from rag_engine.src.inference_plane.reader import InferenceReader, RetrievalResult
+    from rag_engine.src.control_plane.manager import ControlPlaneManager, DataChecklist
+    RAG_AVAILABLE = True
+except ImportError as e:
+    logger = get_logger("PINECONE_CLIENT")
+    logger.critical(f"RAG Engine import failed: {e}")
+    RAG_AVAILABLE = False
 
 # --- Smart Retrieval Imports ---
 try:
@@ -21,23 +30,28 @@ try:
     from retrieval.context_compressor import compress_context
     SMART_COMPONENTS_AVAILABLE = True
 except ImportError as e:
+    # logger might not be init if imports fail above
+    if 'logger' not in locals(): logger = get_logger("PINECONE_CLIENT")
     logger.warning(f"Smart components import failed: {e}")
     SMART_COMPONENTS_AVAILABLE = False
 
 logger = get_logger("PINECONE_CLIENT")
 
-# --- RAG Integration ---
-try:
-    from rag_engine.src.orchestrate import orchestrate
-    from rag_engine.src.control_plane.manager import DataChecklist
-    RAG_AVAILABLE = True
-except ImportError as e:
-    logger.critical(f"RAG Engine import failed: {e}")
-    RAG_AVAILABLE = False
-
 # Remove direct Pinecone Init as rag_engine handles it
+# But Semantic Cache needs an index object?
+# The user said "in semantic_cache.py... pinecone will automatically produce embedding".
+# The Semantic Cache likely needs to be updated to use the RAG Engine's mechanisms too or a separate index.
+# For now, we expose the index from InferenceReader if needed, or initialized purely for Cache.
+# Given RAG engine initializes its own index in InferenceReader, we might need a handle to it.
 pc: Optional[Pinecone] = None
 index: Any = None
+
+try:
+    reader = InferenceReader()
+    index = reader.index # Expose index for cache if needed
+    pc = reader.pc
+except Exception as e:
+    logger.warning(f"Could not initialize InferenceReader globally: {e}")
 
 def extract_ticker(query: str) -> str:
     """
@@ -81,26 +95,36 @@ def retrieve(
     logger.info(f"Delegating retrieval to RAG Engine for Ticker: {ticker}")
 
     try:
-        # Orchestrate handles Freshness + Retrieval
-        # We perform a 'Retrieve Only' logical flow but via the orchestrator to ensure data is there.
-        # Check if we should enforce unstructured data (e.g. if query mentions 'filing' or 'report')
+        # We need to Ensure Data Ready (Control Plane)
+        # In a real high-throughput app, we might separate this, but for this Agent:
+        manager = ControlPlaneManager()
+        # Ensure fresh price (structured) and check unstructured
         checklist = DataChecklist(structured=["price"], unstructured=True)
         
-        result = orchestrate(
-            ticker=ticker,
+        # We perform the check. This prints to stdout, which is fine.
+        manager.ensure_data_ready(ticker, checklist)
+        
+        # Now Retrieve (Inference Plane)
+        # We use a fresh reader to avoid stale state if any
+        reader_instance = InferenceReader()
+        
+        # Call the RAG retrieval
+        # Note: filters mapping might be needed if generic filters are passed
+        result: RetrievalResult = reader_instance.retrieve(
             query=query,
-            checklist=checklist,
-            top_k=top_k
+            ticker=ticker,
+            top_k=top_k,
+            filter_dict=filters
         )
         
         chunks = []
-        for match in result.retrieval_matches:
+        for match in result.matches:
             chunks.append(
                 Chunk(
-                    id=match.get('id', 'unknown'),
-                    text=match.get('text', ''),
-                    score=match.get('score', 0.0),
-                    metadata=match.get('metadata', {})
+                    id=match.id,
+                    text=match.text,
+                    score=match.score,
+                    metadata=match.metadata
                 )
             )
         
@@ -125,7 +149,6 @@ def smart_retrieve(query: str, chat_history: str = "None") -> List[Chunk]:
 
     try:
         # 2. Prepare Query List
-        # We start with the raw query to guarantee at least basic retrieval performance
         queries = [query]
         
         # Attempt refinement
@@ -143,7 +166,6 @@ def smart_retrieve(query: str, chat_history: str = "None") -> List[Chunk]:
         logger.info(f"Executing smart retrieval with {len(queries)} query variations.")
         
         for q in queries:
-            # We use a slightly lower top_k for variations to keep context focused
             results = retrieve(q, top_k=3) 
             for chunk in results:
                 if chunk.id not in seen_ids:
@@ -153,7 +175,6 @@ def smart_retrieve(query: str, chat_history: str = "None") -> List[Chunk]:
         logger.info(f"Smart Retrieve found {len(all_chunks)} unique chunks before compression.")
         
         # 4. Context Compression & Deduplication (Query Aware)
-        # We pass the original user query to ensure compression preserves relevant info
         if all_chunks:
             return compress_context(all_chunks, query)
             
